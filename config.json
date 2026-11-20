@@ -1,0 +1,19 @@
+{
+  "device": "valkyrie_ms9132",
+  "media": {
+    "file_path": "assets/sample.mp4",
+    "scale_mode": "crop",
+    "loop": true,
+    "target_fps": 30
+  },
+  "driver_options": {
+    "vid": 13407,
+    "pid": 37170,
+    "width": 480,
+    "height": 480,
+    "fps": 30,
+    "chunk_size": 16384,
+    "simulation_mode": false
+  },
+  "preview_window": false
+}
