@@ -1,19 +1,40 @@
 {
   "device": "valkyrie_ms9132",
+  "simulate": false,
+  "preview": false,
+  "log_level": "INFO",
+  "stats_interval": 5,
+
   "media": {
-    "file_path": "assets/sample.mp4",
+    "source": "test_pattern",
     "scale_mode": "crop",
+    "rotate": 0,
     "loop": true,
-    "target_fps": 30
+    "fps": 30,
+    "static_fps": 1,
+    "cache_mb": 256,
+    "prefetch": 3,
+    "hw_decode": false
   },
+
   "driver_options": {
-    "vid": 13407,
-    "pid": 37170,
+    "vid": "0x345F",
+    "pid": "0x9132",
     "width": 480,
     "height": 480,
-    "fps": 30,
-    "chunk_size": 16384,
-    "simulation_mode": false
+    "frame_protocol": "ms912x",
+    "yuv_range": "limited",
+    "interface": 0,
+    "endpoint_out": null,
+    "chunk_size": 0,
+    "timeout_ms": 1000,
+    "init_sequence": [],
+    "deinit_sequence": []
   },
-  "preview_window": false
+
+  "reconnect": {
+    "enabled": true,
+    "delay_sec": 2,
+    "max_attempts": 0
+  }
 }

@@ -1,187 +1,273 @@
 """
-AIO Lite Streamer - Main Application
-Loads configuration -> Initializes selected hardware driver -> Streams video loop to AIO LCD.
+AIO Lite Streamer — điểm vào chương trình.
+
+Đọc config.json → tạo đúng driver → chạy luồng stream (giải mã/encode ở luồng nền,
+luồng chính chỉ giữ nhịp FPS và gửi USB), tự kết nối lại khi USB bị ngắt.
+
+    python main.py                     # chạy theo config.json
+    python main.py --sim --preview     # thử không cần phần cứng, xem trên desktop
+    python main.py -v video.mp4 --fps 24
+    python main.py --list-drivers
 """
 
+from __future__ import annotations
+
+import argparse
+import json
+import logging
 import os
 import sys
-import json
 import time
-import signal
-import argparse
-from typing import Dict, Any
-import numpy as np
-import cv2
+from typing import Any, Dict, Optional
 
-from core.media_engine import MediaEngine
-from drivers import get_driver
+# Luôn chạy được dù gọi main.py từ thư mục khác.
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
+from core.media_engine import TEST_PATTERN, FramePacer, MediaEngine  # noqa: E402
+from core.usb_transport import TransportError  # noqa: E402
+from drivers import available_drivers, get_driver, load_errors  # noqa: E402
 
-def create_default_test_video(output_path: str, width: int = 480, height: int = 480, duration_sec: int = 4, fps: int = 30):
-    """Generates a stylish test animation video if no custom video is provided."""
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+log = logging.getLogger("aio")
 
-    total_frames = duration_sec * fps
-    center = (width // 2, height // 2)
-    radius = min(width, height) // 3
+PREVIEW_WINDOW = "AIO Lite Streamer - Preview (q/Esc de thoat)"
 
-    for i in range(total_frames):
-        frame = np.zeros((height, width, 3), dtype=np.uint8)
-
-        # Draw tech ring
-        angle = (i / total_frames) * 360
-        color_val = int(127 + 127 * np.sin(i / 10.0))
-        cv2.circle(frame, center, radius, (255, 180, 50), 3)
-        cv2.circle(frame, center, radius + 20, (50, color_val, 255), 2)
-
-        # Rotating tick marker
-        rad = np.radians(angle)
-        x2 = int(center[0] + radius * np.cos(rad))
-        y2 = int(center[1] + radius * np.sin(rad))
-        cv2.line(frame, center, (x2, y2), (0, 255, 255), 3)
-
-        # Text HUD
-        cv2.putText(frame, "AIO LITE STREAMER", (width // 2 - 130, height // 2 - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Frame: {i:04d}", (width // 2 - 60, height // 2 + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-
-        out.write(frame)
-
-    out.release()
-    print(f"[Init] Created sample test pattern video: {output_path}")
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "device": "valkyrie_ms9132",
+    "simulate": False,
+    "preview": False,
+    "log_level": "INFO",
+    "stats_interval": 5,
+    "media": {
+        "source": TEST_PATTERN,
+        "scale_mode": "crop",
+        "rotate": 0,
+        "loop": True,
+        "fps": None,
+        "static_fps": 1,
+        "cache_mb": 256,
+        "prefetch": 3,
+        "hw_decode": False,
+    },
+    "driver_options": {},
+    "reconnect": {"enabled": True, "delay_sec": 2.0, "max_attempts": 0},
+}
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from JSON file."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+class StopStreaming(Exception):
+    """Người dùng yêu cầu dừng (đóng cửa sổ preview / hết --duration)."""
 
 
-def main():
-    parser = argparse.ArgumentParser(description="AIO Lite Streamer - Ultra-lightweight video streamer for AIO LCDs")
-    parser.add_argument("-c", "--config", default="config.json", help="Path to config.json (default: config.json)")
-    parser.add_argument("-v", "--video", help="Override video file path")
-    parser.add_argument("-d", "--device", help="Override device driver name")
-    parser.add_argument("-p", "--preview", action="store_true", help="Show live preview window on desktop")
-    parser.add_argument("-s", "--sim", action="store_true", help="Force simulation mode (no physical USB write)")
-    args = parser.parse_args()
+# --------------------------------------------------------------------------- #
+#  Cấu hình                                                                    #
+# --------------------------------------------------------------------------- #
+def _merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
-    print("=" * 60)
-    print("           ⚡ AIO LITE STREAMER - HARDWARE ENGINE ⚡")
-    print("=" * 60)
 
-    # 1. Load config
-    config = load_config(args.config)
-    device_name = args.device or config.get("device", "valkyrie_ms9132")
-    media_cfg = config.get("media", {})
-    driver_opts = config.get("driver_options", {})
-    show_preview = args.preview or config.get("preview_window", False)
+def load_config(path: str) -> Dict[str, Any]:
+    user: Dict[str, Any] = {}
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8-sig") as f:
+            try:
+                user = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"config.json lỗi cú pháp (dòng {exc.lineno}, cột {exc.colno}): {exc.msg}")
+    else:
+        print(f"[!] Không thấy {path} — dùng cấu hình mặc định.")
+    cfg = _merge(DEFAULT_CONFIG, user)
 
-    if args.sim:
-        driver_opts["simulation_mode"] = True
+    # Tương thích khóa cũ.
+    media, drv = cfg["media"], cfg["driver_options"]
+    if "file_path" in media and "source" not in user.get("media", {}):
+        media["source"] = media["file_path"]
+    if "target_fps" in media and "fps" not in user.get("media", {}):
+        media["fps"] = media["target_fps"]
+    if "preview_window" in user and "preview" not in user:
+        cfg["preview"] = user["preview_window"]
+    if "simulation_mode" in drv and "simulate" not in user:
+        cfg["simulate"] = drv["simulation_mode"]
+    return cfg
 
-    video_path = args.video or media_cfg.get("file_path", "assets/sample.mp4")
 
-    # If video doesn't exist, create an eye-catching test video
-    if not os.path.exists(video_path):
-        print(f"[Media] Video file '{video_path}' not found.")
-        video_path = "assets/sample.mp4"
-        if not os.path.exists(video_path):
-            create_default_test_video(video_path, width=480, height=480)
+def resolve_source(source: Optional[str], base_dir: str) -> str:
+    if not source or source == TEST_PATTERN:
+        return TEST_PATTERN
+    path = os.path.expanduser(str(source))
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir, path)
+    if not os.path.isfile(path):
+        log.warning("Không thấy file media '%s' → dùng hình test.", source)
+        return TEST_PATTERN
+    return path
 
-    # 2. Instantiate Hardware Driver
-    print(f"[Device] Loading driver for: '{device_name}'...")
-    driver = get_driver(device_name, options=driver_opts)
 
-    print(f"[Device] Target resolution: {driver.target_width}x{driver.target_height}")
-    print(f"[Device] Color format: {driver.color_format.upper()} | Target FPS: {driver.fps}")
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="AIO Lite Streamer — stream video lên màn LCD tản nhiệt AIO")
+    p.add_argument("-c", "--config", default=os.path.join(ROOT, "config.json"), help="đường dẫn config.json")
+    p.add_argument("-d", "--device", help="ghi đè driver (vd valkyrie_ms9132)")
+    p.add_argument("-v", "--video", help="ghi đè nguồn media (video/ảnh/test_pattern)")
+    p.add_argument("--fps", type=float, help="ghi đè FPS")
+    p.add_argument("--scale", choices=("crop", "fit", "stretch"), help="ghi đè scale_mode")
+    p.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), help="ghi đè góc xoay")
+    p.add_argument("-s", "--sim", action="store_true", help="chế độ giả lập (không ghi USB)")
+    p.add_argument("-p", "--preview", action="store_true", help="hiện cửa sổ xem trước")
+    p.add_argument("--duration", type=float, default=0, help="tự dừng sau N giây (0 = chạy mãi)")
+    p.add_argument("--list-drivers", action="store_true", help="liệt kê driver rồi thoát")
+    p.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), help="mức log")
+    return p.parse_args(argv)
 
-    # 3. Connect to hardware
-    if not driver.connect():
-        print("[Device] Failed to initialize hardware driver. Exiting.")
-        sys.exit(1)
 
-    # 4. Initialize Media Engine
-    target_fps = media_cfg.get("target_fps", driver.fps)
-    scale_mode = media_cfg.get("scale_mode", "crop")
-    loop = media_cfg.get("loop", True)
+def list_drivers() -> None:
+    print("Driver hiện có:")
+    for driver_id, cls in sorted(available_drivers().items()):
+        status = "đã kiểm chứng" if cls.VERIFIED else "chưa kiểm chứng"
+        aliases = f" (alias: {', '.join(cls.ALIASES)})" if cls.ALIASES else ""
+        print(f"  {driver_id:<18} {cls.DISPLAY_NAME} — {cls.DEFAULT_WIDTH}x{cls.DEFAULT_HEIGHT} "
+              f"{cls.COLOR_FORMAT.upper()} [{status}]{aliases}")
+    for name, err in load_errors().items():
+        print(f"  {name:<18} LỖI IMPORT: {err}")
 
-    print(f"[Media] Initializing MediaEngine: {video_path}")
-    print(f"[Media] Scaling Mode: {scale_mode.upper()} | Loop: {loop}")
 
-    media_engine = MediaEngine(
-        video_path=video_path,
-        target_width=driver.target_width,
-        target_height=driver.target_height,
-        target_fps=target_fps,
-        scale_mode=scale_mode,
-        loop=loop,
+# --------------------------------------------------------------------------- #
+#  Stream                                                                      #
+# --------------------------------------------------------------------------- #
+def connect_with_retry(driver, reconnect: Dict[str, Any], first: bool) -> None:
+    """Kết nối driver; lần đầu thất bại thì thoát luôn, sau đó thử lại theo cấu hình."""
+    attempt = 0
+    max_attempts = int(reconnect.get("max_attempts") or 0)
+    delay = max(0.2, float(reconnect.get("delay_sec") or 2.0))
+    while True:
+        try:
+            driver.connect()
+            return
+        except (TransportError, NotImplementedError) as exc:
+            if first or not reconnect.get("enabled", True):
+                raise
+            attempt += 1
+            if max_attempts and attempt >= max_attempts:
+                raise
+            log.warning("Kết nối lại thất bại (%d): %s — thử lại sau %.1fs", attempt, exc, delay)
+            time.sleep(delay)
+
+
+def run(cfg: Dict[str, Any], args: argparse.Namespace) -> int:
+    media_cfg = cfg["media"]
+    simulate = bool(args.sim or cfg.get("simulate"))
+    preview = bool(args.preview or cfg.get("preview"))
+
+    driver = get_driver(args.device or cfg["device"], cfg["driver_options"], simulate=simulate)
+    source = resolve_source(args.video or media_cfg.get("source"), os.path.dirname(os.path.abspath(args.config)))
+    fps = args.fps or media_cfg.get("fps") or driver.fps
+
+    cv2 = None
+    if preview:
+        import cv2  # noqa: F811
+
+        def encoder(frame):  # giữ lại khung BGR để hiện preview
+            return frame, driver.encode(frame)
+    else:
+        encoder = driver.encode
+
+    engine = MediaEngine(
+        source,
+        driver.width,
+        driver.height,
+        fps=fps,
+        static_fps=float(media_cfg.get("static_fps") or 1),
+        scale_mode=args.scale or media_cfg.get("scale_mode", "crop"),
+        rotate=args.rotate if args.rotate is not None else int(media_cfg.get("rotate") or 0),
+        loop=bool(media_cfg.get("loop", True)),
+        encoder=encoder,
+        prefetch=int(media_cfg.get("prefetch") or 3),
+        cache_mb=float(media_cfg.get("cache_mb", 256)),
+        hw_decode=bool(media_cfg.get("hw_decode", False)),
     )
 
-    # Handle graceful exit on Ctrl+C / SIGINT
-    running = True
+    log.info("Thiết bị : %s | %dx%d %s%s", driver.name, driver.width, driver.height,
+             driver.color_format.upper(), " | GIẢ LẬP" if simulate else "")
+    log.info("Nguồn    : %s | %.2f fps%s", "hình test" if source == TEST_PATTERN else source, engine.fps,
+             "" if engine.is_static else f" (gốc {engine.source_fps:.2f})")
 
-    def handle_sigint(signum, frame):
-        nonlocal running
-        print("\n[System] Stop signal received. Shutting down gracefully...")
-        running = False
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    # 5. Main streaming loop
-    print("\n" + "-" * 60)
-    print("🚀 Streaming active! Press Ctrl+C in terminal to stop.")
-    if show_preview:
-        print("🖥️  Preview window enabled. Press 'q' on preview window to quit.")
-    print("-" * 60 + "\n")
-
-    fps_timer = time.perf_counter()
-    fps_counter = 0
+    reconnect = cfg.get("reconnect") or {}
+    stats_every = max(1.0, float(cfg.get("stats_interval") or 5))
+    deadline = time.monotonic() + args.duration if args.duration > 0 else None
+    pacer = FramePacer(engine.fps)
+    errors = 0
 
     try:
-        for frame, frame_idx in media_engine.stream_frames():
-            if not running:
-                break
+        connect_with_retry(driver, reconnect, first=True)
+        log.info("Đang stream — nhấn Ctrl+C để dừng.")
+        t_stats, n_stats = time.perf_counter(), 0
 
-            # Send image to AIO LCD driver
-            driver.send_image(frame)
-            fps_counter += 1
+        for item in engine.stream():
+            if preview:
+                frame, payload = item
+                cv2.imshow(PREVIEW_WINDOW, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27) or cv2.getWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                    raise StopStreaming
+            else:
+                payload = item
 
-            # Optional desktop preview window
-            if show_preview:
-                cv2.imshow("AIO Streamer Preview", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    print("[Preview] Quit requested from preview window.")
-                    break
+            pacer.wait()
+            try:
+                driver.send(payload)
+                errors = 0
+            except TransportError as exc:
+                errors += 1
+                log.error("Gửi khung thất bại: %s", exc)
+                if not reconnect.get("enabled", True):
+                    raise
+                if errors >= 3:
+                    log.warning("USB lỗi liên tục → kết nối lại thiết bị...")
+                    driver.disconnect()
+                    connect_with_retry(driver, reconnect, first=False)
+                    errors = 0
 
-            # Print statistics every 2 seconds
+            n_stats += 1
             now = time.perf_counter()
-            elapsed = now - fps_timer
-            if elapsed >= 2.0:
-                current_fps = fps_counter / elapsed
-                mb_sent = driver.bytes_sent / (1024 * 1024)
-                print(f"[Stats] Frame: {frame_idx:05d} | Real FPS: {current_fps:5.1f} | Data Sent: {mb_sent:6.2f} MB")
-                fps_counter = 0
-                fps_timer = now
-
-    except Exception as e:
-        print(f"[Error] Streaming error occurred: {e}")
-
+            if now - t_stats >= stats_every:
+                log.info("FPS %5.1f | %6d khung | %8.1f MB đã gửi%s",
+                         n_stats / (now - t_stats), driver.frames_sent, driver.bytes_sent / 1048576,
+                         " | phát từ cache RAM" if engine.is_cached else "")
+                t_stats, n_stats = now, 0
+            if deadline and time.monotonic() >= deadline:
+                raise StopStreaming
+    except (KeyboardInterrupt, StopStreaming):
+        log.info("Đang dừng...")
     finally:
-        # Cleanup
-        print("[System] Cleaning up resources...")
-        media_engine.release()
+        engine.close()
         driver.disconnect()
-        if show_preview:
+        if cv2 is not None:
             cv2.destroyAllWindows()
-        print("[System] Done. Exited safely.")
+    log.info("Hoàn tất: %d khung, %.1f MB.", driver.frames_sent, driver.bytes_sent / 1048576)
+    return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    cfg = load_config(args.config)
+    level = args.log_level or str(cfg.get("log_level", "INFO")).upper()
+    logging.basicConfig(level=getattr(logging, level, logging.INFO),
+                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S")
+
+    if args.list_drivers:
+        list_drivers()
+        return 0
+    try:
+        return run(cfg, args)
+    except (TransportError, NotImplementedError, FileNotFoundError, ValueError, RuntimeError) as exc:
+        log.error("%s", exc)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

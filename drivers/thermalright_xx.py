@@ -1,87 +1,98 @@
 """
-Driver for Thermalright AIO series (Frozen Warframe, TR-Vision, Frozen Horizon).
-Example implementation for community developers.
-Supports RGB565 / JPEG payload framing over USB Bulk or Serial COM bridge.
+Driver MẪU "cấu hình được" — dùng cho Thermalright hoặc bất kỳ màn USB Bulk nào.
+
+Cho phép thử giao thức vừa bắt được bằng Wireshark CHỈ bằng config.json, không cần viết code:
+
+    "device": "thermalright_xx",
+    "driver_options": {
+        "vid": "0x....", "pid": "0x....",          // bắt buộc — lấy từ Device Manager
+        "width": 320, "height": 240,
+        "color_format": "rgb565", "big_endian": false,
+        "header_hex": "",                         // byte cố định đầu mỗi khung
+        "length_field": "none",                   // none | le16 | be16 | le32 | be32 (độ dài điểm ảnh, sau header)
+        "footer_hex": "",                         // byte cố định cuối khung
+        "init_sequence": [],                      // lệnh control transfer khi kết nối
+        "chunk_size": 0
+    }
+
+Các dòng Thermalright khác nhau dùng giao thức khác nhau (một số dùng USB HID hoặc
+cổng COM ảo thay vì Bulk) — chưa có cấu hình nào được kiểm chứng.
+Khi đã chạy đúng trên máy bạn, hãy tạo driver riêng (vd thermalright_frozen_warframe.py)
+với giá trị mặc định cố định và đặt VERIFIED = True.
 """
 
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
+import struct
+
+from core.usb_transport import (
+    TransportError,
+    UsbBulkDevice,
+    parse_control_sequence,
+    parse_hex_bytes,
+    parse_int,
+)
+
 from .base_driver import BaseDriver
+
+_LENGTH_FORMATS = {"none": None, "le16": "<H", "be16": ">H", "le32": "<I", "be32": ">I"}
 
 
 class ThermalrightDriver(BaseDriver):
-    """
-    Driver template for Thermalright LCD screens.
-    Resolution: typically 320x240 or 480x480.
-    Format: RGB565 (16-bit color) or JPEG.
-    """
-
-    # Common Thermalright / CH340 / Custom USB IDs
-    DEFAULT_VID = 0x1A86  # QinHeng CH340 / USB Serial or custom vendor
-    DEFAULT_PID = 0x7523
+    DRIVER_ID = "thermalright_xx"
+    ALIASES = ("thermalright", "generic_bulk")
+    DISPLAY_NAME = "Thermalright / USB Bulk tổng quát (mẫu)"
     DEFAULT_WIDTH = 320
     DEFAULT_HEIGHT = 240
-    DEFAULT_FPS = 30
+    COLOR_FORMAT = "rgb565"
+    VERIFIED = False
 
-    def __init__(self, options: Optional[Dict[str, Any]] = None):
-        opts = options or {}
-        super().__init__(
-            name="Thermalright AIO (Generic/Warframe)",
-            target_width=opts.get("width", self.DEFAULT_WIDTH),
-            target_height=opts.get("height", self.DEFAULT_HEIGHT),
-            color_format=opts.get("color_format", "rgb565"),
-            fps=opts.get("fps", self.DEFAULT_FPS),
-            options=opts,
+    def __init__(self, options=None, *, simulate: bool = False):
+        super().__init__(options, simulate=simulate)
+        opts = self.options
+
+        self._header = parse_hex_bytes(opts.get("header_hex"))
+        self._footer = parse_hex_bytes(opts.get("footer_hex"))
+        length_key = str(opts.get("length_field", "none")).lower()
+        if length_key not in _LENGTH_FORMATS:
+            raise ValueError(f"[{self.name}] length_field phải là {sorted(_LENGTH_FORMATS)}")
+        self._length_fmt = _LENGTH_FORMATS[length_key]
+        if self._length_fmt and self.raw_frame_size is not None:
+            # Định dạng thô: độ dài cố định → tính sẵn header 1 lần.
+            self._header += struct.pack(self._length_fmt, self.raw_frame_size)
+            self._length_fmt = None
+
+        self.init_sequence = parse_control_sequence(opts.get("init_sequence"))
+        vid = parse_int(opts.get("vid"), None)
+        pid = parse_int(opts.get("pid"), None)
+        if not simulate and (vid is None or pid is None):
+            raise ValueError(f"[{self.name}] Cần khai báo 'vid' và 'pid' trong driver_options")
+        self._usb = UsbBulkDevice(
+            vid or 0,
+            pid or 0,
+            interface=parse_int(opts.get("interface"), 0),
+            endpoint_out=parse_int(opts.get("endpoint_out"), None),
+            timeout_ms=parse_int(opts.get("timeout_ms"), 1000),
+            chunk_size=parse_int(opts.get("chunk_size"), 0),
         )
 
-        self.vid = opts.get("vid", self.DEFAULT_VID)
-        self.pid = opts.get("pid", self.DEFAULT_PID)
-        self.simulation_mode = opts.get("simulation_mode", False)
-        self.packet_header = bytes.fromhex(opts.get("header_hex", "AA550100"))
+    def build_payload(self, pixels: bytes) -> bytes:
+        if self._length_fmt:  # định dạng nén (JPEG): độ dài thay đổi từng khung
+            return b"".join((self._header, struct.pack(self._length_fmt, len(pixels)), pixels, self._footer))
+        if not self._header and not self._footer:
+            return pixels
+        return b"".join((self._header, pixels, self._footer))
 
-    def connect(self) -> bool:
-        """Initialize connection to Thermalright display."""
-        if self.simulation_mode:
-            print(f"[{self.name}] SIMULATION MODE ENABLED: Virtual Thermalright connected.")
-            self.is_connected = True
-            return True
-
-        # Template for hardware connection:
-        # 1. If USB Bulk / PyUSB: find device by self.vid, self.pid
-        # 2. If Serial COM (pyserial): open port (e.g., COM3) at 115200 or 921600 baud
-        print(f"[{self.name}] Connecting to Thermalright display VID=0x{self.vid:04X}, PID=0x{self.pid:04X}...")
-        print(f"[{self.name}] Note: Set 'simulation_mode': true in config.json if testing without hardware.")
-        
-        # Defaulting to simulation for template safety
-        self.simulation_mode = True
-        self.is_connected = True
-        return True
-
-    def send_frame(self, frame_bytes: bytes) -> bool:
-        """
-        Sends frame payload to Thermalright screen.
-        Structure typically consists of:
-        [Header Magic (e.g. 0xAA, 0x55)] + [Length (4 bytes)] + [Frame Data (RGB565)] + [Checksum]
-        """
-        if not self.is_connected:
-            return False
-
-        if self.simulation_mode:
-            return True
-
+    def _open(self) -> None:
+        self._usb.open()
         try:
-            payload_len = len(frame_bytes)
-            # Example framing:
-            header = self.packet_header + payload_len.to_bytes(4, byteorder="little")
-            packet = header + frame_bytes
+            self._usb.run_sequence(self.init_sequence)
+        except TransportError:
+            self._usb.close()
+            raise
 
-            # TODO: Write to hardware transport (Serial write or USB bulk write)
-            # self.serial_port.write(packet)
-            return True
-        except Exception as e:
-            print(f"[{self.name}] Send frame failed: {e}")
-            return False
+    def _write(self, payload: bytes) -> None:
+        self._usb.write(payload)
 
-    def disconnect(self) -> None:
-        """Clean up handles."""
-        self.is_connected = False
-        print(f"[{self.name}] Disconnected.")
+    def _close(self) -> None:
+        self._usb.close()

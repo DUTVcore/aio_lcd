@@ -1,149 +1,118 @@
 """
-Driver for Valkyrie B360-GT AIO Cooler (MacroSilicon MS9132 USB Display Controller).
-Uses USB Bulk Transfer to stream UYVY / YUV422 frames directly to the circular screen.
+Driver Valkyrie B360-GT — chip cầu hiển thị USB MacroSilicon MS9132.
+
+Giao thức khung hình (frame_protocol = "ms912x"), tham khảo driver Linux mã nguồn mở
+`ms912x` (MS9120/MS9132):
+
+    Header 8 byte : FF 00 | x/16 (1B) | y (2B, big-endian) | w/16 (1B) | h (2B, big-endian)
+    Điểm ảnh      : UYVY (YUV 4:2:2), w*h*2 byte, dải "limited" (Y 16..235)
+    Kết thúc      : FF C0 00 00 00 00 00 00
+
+    → 480x480: 8 + 460800 + 8 = 460816 byte / khung, gửi qua endpoint Bulk OUT.
+
+⚠ Chưa kiểm chứng trên B360-GT thật:
+  - VID/PID mặc định 345F:9132 là ID phổ biến của MS9132, hãy xem đúng ID trong Device Manager.
+  - MS91xx thường cần lệnh khởi tạo (bật nguồn / đặt độ phân giải) qua HID control transfer
+    trước khi nhận khung. Bắt các lệnh này từ phần mềm gốc bằng Wireshark rồi điền vào
+    `driver_options.init_sequence` (xem README). `deinit_sequence` chạy khi thoát.
+  - Nếu màn chỉ nhận dữ liệu thô, đặt "frame_protocol": "raw".
 """
 
-import sys
-import time
-from typing import Optional, Dict, Any
+from __future__ import annotations
+
+import struct
+
+from core.usb_transport import (
+    TransportError,
+    UsbBulkDevice,
+    parse_control_sequence,
+    parse_int,
+)
+
 from .base_driver import BaseDriver
 
-try:
-    import usb.core
-    import usb.util
-    HAS_PYUSB = True
-except ImportError:
-    HAS_PYUSB = False
+_MS912X_END = bytes((0xFF, 0xC0, 0, 0, 0, 0, 0, 0))
+_PROTOCOLS = ("ms912x", "raw")
 
 
 class ValkyrieMS9132Driver(BaseDriver):
-    """
-    Driver for Valkyrie B360-GT AIO (MS9132 Bridge).
-    Resolution: 480x480 (IPS Circle)
-    Format: UYVY (YUV422 Interleaved)
-    Transfer: USB Bulk OUT
-    """
-
-    # Typical USB Vendor and Product IDs for MacroSilicon MS9132 display controller
-    DEFAULT_VID = 0x345F  # MacroSilicon VID (or customize via config)
-    DEFAULT_PID = 0x9132  # MS9132 PID
+    DRIVER_ID = "valkyrie_ms9132"
+    ALIASES = ("b360_gt", "valkyrie_b360", "ms9132")
+    DISPLAY_NAME = "Valkyrie B360-GT (MS9132)"
     DEFAULT_WIDTH = 480
     DEFAULT_HEIGHT = 480
     DEFAULT_FPS = 30
-    DEFAULT_CHUNK_SIZE = 16384  # 16KB bulk packets
+    COLOR_FORMAT = "uyvy"
+    VERIFIED = False
 
-    def __init__(self, options: Optional[Dict[str, Any]] = None):
-        opts = options or {}
-        super().__init__(
-            name="Valkyrie B360-GT (MS9132)",
-            target_width=opts.get("width", self.DEFAULT_WIDTH),
-            target_height=opts.get("height", self.DEFAULT_HEIGHT),
-            color_format="uyvy",
-            fps=opts.get("fps", self.DEFAULT_FPS),
-            options=opts,
+    DEFAULT_VID = 0x345F
+    DEFAULT_PID = 0x9132
+
+    def __init__(self, options=None, *, simulate: bool = False):
+        super().__init__(options, simulate=simulate)
+        opts = self.options
+
+        self.protocol = str(opts.get("frame_protocol", "ms912x")).lower()
+        if self.protocol not in _PROTOCOLS:
+            raise ValueError(f"[{self.name}] frame_protocol phải là {_PROTOCOLS} (nhận '{self.protocol}')")
+
+        if self.protocol == "ms912x":
+            if self.color_format not in ("uyvy", "yuyv"):
+                raise ValueError(f"[{self.name}] Giao thức ms912x cần định dạng YUV 4:2:2")
+            if self.width % 16:
+                raise ValueError(f"[{self.name}] Giao thức ms912x cần width chia hết cho 16 (nhận {self.width})")
+            off_x = parse_int(opts.get("offset_x"), 0)
+            off_y = parse_int(opts.get("offset_y"), 0)
+            if off_x % 16:
+                raise ValueError(f"[{self.name}] offset_x phải chia hết cho 16")
+            # Header tính sẵn 1 lần — mỗi khung chỉ còn việc ghép bytes.
+            self._header = struct.pack(">HBHBH", 0xFF00, off_x // 16, off_y, self.width // 16, self.height)
+            self._footer = _MS912X_END
+        else:
+            self._header = self._footer = b""
+
+        self.init_sequence = parse_control_sequence(opts.get("init_sequence"))
+        self.deinit_sequence = parse_control_sequence(opts.get("deinit_sequence"))
+        self._usb = UsbBulkDevice(
+            parse_int(opts.get("vid"), self.DEFAULT_VID),
+            parse_int(opts.get("pid"), self.DEFAULT_PID),
+            interface=parse_int(opts.get("interface"), 0),
+            endpoint_out=parse_int(opts.get("endpoint_out"), None),
+            timeout_ms=parse_int(opts.get("timeout_ms"), 1000),
+            chunk_size=parse_int(opts.get("chunk_size"), 0),
         )
 
-        self.vid = opts.get("vid", self.DEFAULT_VID)
-        self.pid = opts.get("pid", self.DEFAULT_PID)
-        self.chunk_size = opts.get("chunk_size", self.DEFAULT_CHUNK_SIZE)
-        self.simulation_mode = opts.get("simulation_mode", False)
+    def build_payload(self, pixels: bytes) -> bytes:
+        if not self._header:
+            return pixels
+        return b"".join((self._header, pixels, self._footer))
 
-        self.device = None
-        self.ep_out = None
-        self.interface_num = 0
-
-    def connect(self) -> bool:
-        """Find device via PyUSB, set configuration, and claim OUT bulk endpoint."""
-        if self.simulation_mode:
-            print(f"[{self.name}] SIMULATION MODE ENABLED: Virtual connection established.")
-            self.is_connected = True
-            return True
-
-        if not HAS_PYUSB:
-            print(f"[{self.name}] ERROR: 'pyusb' is not installed. Run 'pip install pyusb'.")
-            print(f"[{self.name}] Falling back to Simulation Mode for testing.")
-            self.simulation_mode = True
-            self.is_connected = True
-            return True
-
-        print(f"[{self.name}] Searching for USB device VID=0x{self.vid:04X}, PID=0x{self.pid:04X}...")
-
+    def _open(self) -> None:
+        usb = self._usb
+        self.log.info("Đang mở USB %04X:%04X ...", usb.vid, usb.pid)
+        usb.open()
         try:
-            self.device = usb.core.find(idVendor=self.vid, idProduct=self.pid)
-            if self.device is None:
-                print(f"[{self.name}] WARNING: Physical device 0x{self.vid:04X}:0x{self.pid:04X} not found.")
-                print(f"[{self.name}] Tip: Check USB cable or verify VID/PID in config.json.")
-                print(f"[{self.name}] Switching to Simulation Mode to verify video pipeline.")
-                self.simulation_mode = True
-                self.is_connected = True
-                return True
+            if self.init_sequence:
+                self.log.info("Gửi %d lệnh khởi tạo.", len(self.init_sequence))
+                usb.run_sequence(self.init_sequence)
+            elif self.protocol == "ms912x":
+                self.log.warning("init_sequence trống — nếu màn không hiện hình, hãy bắt lệnh khởi tạo "
+                                 "bằng Wireshark (xem README).")
+        except TransportError:
+            usb.close()
+            raise
+        self.log.info("Endpoint OUT 0x%02X | %d byte/khung | giao thức %s",
+                      usb.endpoint_address, self.raw_frame_size + len(self._header) + len(self._footer),
+                      self.protocol)
 
-            # Reset and detach kernel driver if necessary (Linux/WinUSB)
-            try:
-                if self.device.is_kernel_driver_active(0):
-                    self.device.detach_kernel_driver(0)
-            except Exception:
-                pass
+    def _write(self, payload: bytes) -> None:
+        self._usb.write(payload)
 
-            self.device.set_configuration()
-            cfg = self.device.get_active_configuration()
-            intf = cfg[(0, 0)]
-
-            # Locate Bulk OUT endpoint
-            self.ep_out = usb.util.find_descriptor(
-                intf,
-                custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-                and usb.util.endpoint_type(e.bEndpointAddress) == usb.util.ENDPOINT_TYPE_BULK,
-            )
-
-            if self.ep_out is None:
-                raise RuntimeError("Could not find Bulk OUT endpoint on Valkyrie MS9132.")
-
-            self.is_connected = True
-            print(f"[{self.name}] Successfully connected to Valkyrie MS9132! Endpoint: 0x{self.ep_out.bEndpointAddress:02X}")
-            return True
-
-        except Exception as e:
-            print(f"[{self.name}] Failed to connect: {e}")
-            print(f"[{self.name}] Note: On Windows, use Zadig to install WinUSB/libusb-win32 driver for this device.")
-            print(f"[{self.name}] Continuing in Simulation Mode.")
-            self.simulation_mode = True
-            self.is_connected = True
-            return True
-
-    def send_frame(self, frame_bytes: bytes) -> bool:
-        """
-        Sends raw UYVY frame data to the MS9132 controller via bulk OUT endpoint.
-        UYVY frame size = width * height * 2 bytes (e.g. 480*480*2 = 460,800 bytes).
-        """
-        if not self.is_connected:
-            return False
-
-        if self.simulation_mode:
-            # Emulate transfer timing (no physical USB I/O)
-            return True
-
+    def _close(self) -> None:
         try:
-            # Send bulk data in chunks to prevent USB buffer overflow
-            total_len = len(frame_bytes)
-            offset = 0
-
-            while offset < total_len:
-                chunk = frame_bytes[offset : offset + self.chunk_size]
-                self.ep_out.write(chunk, timeout=1000)
-                offset += len(chunk)
-
-            return True
-        except Exception as e:
-            print(f"[{self.name}] Error streaming frame: {e}")
-            return False
-
-    def disconnect(self) -> None:
-        """Release device handles."""
-        if self.device is not None and not self.simulation_mode:
-            try:
-                usb.util.dispose_resources(self.device)
-            except Exception:
-                pass
-        self.is_connected = False
-        print(f"[{self.name}] Disconnected.")
+            if self.deinit_sequence and self._usb.is_open:
+                self._usb.run_sequence(self.deinit_sequence)
+        except TransportError as exc:
+            self.log.debug("deinit_sequence lỗi: %s", exc)
+        finally:
+            self._usb.close()
